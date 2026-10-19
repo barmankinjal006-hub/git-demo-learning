@@ -1,13 +1,5 @@
 ```python
-"""
-EcoSort Challenge — Model Training & Export
-============================================
-Usage:
-    python train_template.py --epochs 30 --batch_size 32 --lr 0.001
-"""
-
 import argparse
-import copy
 import os
 from pathlib import Path
 
@@ -17,9 +9,9 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 
-# ============================================================
-# 1. PATHS AND CONFIGURATION
-# ============================================================
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
@@ -29,7 +21,7 @@ CLASSES = [
     "metal",
     "paper",
     "plastic",
-    "trash"
+    "trash",
 ]
 
 MAX_PARAMETERS = 350_000
@@ -39,50 +31,55 @@ MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
 
-# ============================================================
-# 2. MODEL BUILDING BLOCKS
-# ============================================================
+# --------------------------------------------------
+# Convolution Block
+# --------------------------------------------------
 
-class ConvBNAct(nn.Sequential):
-    """Convolution + BatchNorm + optional ReLU."""
-
+class ConvBNAct(nn.Module):
     def __init__(
-        self, in_channels, out_channels,
-        kernel_size=3, stride=1, groups=1,
-        activation=True
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        groups=1,
+        activation=True,
     ):
+        super().__init__()
+
         padding = kernel_size // 2
 
-        layers = [
+        self.block = nn.Sequential(
             nn.Conv2d(
                 in_channels,
                 out_channels,
                 kernel_size,
-                stride=stride,
-                padding=padding,
+                stride,
+                padding,
                 groups=groups,
-                bias=False
+                bias=False,
             ),
-            nn.BatchNorm2d(out_channels)
-        ]
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU6(inplace=True)
+            if activation
+            else nn.Identity(),
+        )
 
-        if activation:
-            layers.append(nn.ReLU6(inplace=True))
+    def forward(self, x):
+        return self.block(x)
 
-        super().__init__(*layers)
 
+# --------------------------------------------------
+# Lightweight Inverted Residual Block
+# --------------------------------------------------
 
 class InvertedResidual(nn.Module):
-    """
-    Lightweight MobileNet-style block.
-
-    Uses pointwise expansion, depthwise convolution,
-    pointwise projection and an optional residual connection.
-    """
-
     def __init__(
-        self, in_channels, out_channels,
-        stride=1, expansion=2
+        self,
+        in_channels,
+        out_channels,
+        stride=1,
+        expansion=2,
     ):
         super().__init__()
 
@@ -96,7 +93,7 @@ class InvertedResidual(nn.Module):
                 ConvBNAct(
                     in_channels,
                     hidden_channels,
-                    kernel_size=1
+                    kernel_size=1,
                 )
             )
 
@@ -107,17 +104,17 @@ class InvertedResidual(nn.Module):
                 hidden_channels,
                 kernel_size=3,
                 stride=stride,
-                groups=hidden_channels
+                groups=hidden_channels,
             )
         )
 
-        # Project to output channels
+        # Project channels
         layers.append(
             ConvBNAct(
                 hidden_channels,
                 out_channels,
                 kernel_size=1,
-                activation=False
+                activation=False,
             )
         )
 
@@ -127,163 +124,146 @@ class InvertedResidual(nn.Module):
             stride == 1 and in_channels == out_channels
         )
 
-        if self.use_residual:
-            self.residual_activation = nn.ReLU6(inplace=True)
-
     def forward(self, x):
-        out = self.block(x)
+        result = self.block(x)
 
         if self.use_residual:
-            out = out + x
-            out = self.residual_activation(out)
+            result = result + x
 
-        return out
+        return result
 
 
-# ============================================================
-# 3. LIGHTWEIGHT CNN CLASSIFIER
-# ============================================================
+# --------------------------------------------------
+# EcoSort CNN Model
+# --------------------------------------------------
 
 class ToyClassifier(nn.Module):
-    """
-    Lightweight replacement for the original toy network.
-
-    Input:  (B, 3, 96, 96)
-    Output: (B, 6)
-    """
-
-    def __init__(self, num_classes: int = 6):
+    def __init__(self, num_classes=6):
         super().__init__()
 
         self.features = nn.Sequential(
-            # Initial feature extraction
-            ConvBNAct(3, 24, kernel_size=3, stride=1),
+            ConvBNAct(3, 24, stride=2),
 
-            # Stage 1
-            InvertedResidual(24, 24, stride=1),
-            InvertedResidual(24, 24, stride=1),
+            InvertedResidual(24, 24),
+            InvertedResidual(24, 24),
 
-            # Stage 2
             InvertedResidual(24, 32, stride=2),
-            InvertedResidual(32, 32, stride=1),
+            InvertedResidual(32, 32),
 
-            # Stage 3
             InvertedResidual(32, 48, stride=2),
-            InvertedResidual(48, 48, stride=1),
+            InvertedResidual(48, 48),
 
-            # Stage 4
             InvertedResidual(48, 64, stride=2),
-            InvertedResidual(64, 64, stride=1),
+            InvertedResidual(64, 64),
 
-            # Stage 5
             InvertedResidual(64, 96, stride=2),
-            InvertedResidual(96, 96, stride=1),
+            InvertedResidual(96, 96),
 
-            # Stage 6
             InvertedResidual(96, 128, stride=2),
-            InvertedResidual(128, 128, stride=1),
+            InvertedResidual(128, 128),
 
-            # Final feature processing
-            ConvBNAct(128, 128, kernel_size=1)
+            ConvBNAct(128, 128, kernel_size=1),
         )
 
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.dropout = nn.Dropout(0.25)
-        self.fc = nn.Linear(128, num_classes)
+        self.pool = nn.AdaptiveAvgPool2d(1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.25),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x):
         x = self.features(x)
         x = self.pool(x)
-        x = torch.flatten(x, 1)
-        x = self.dropout(x)
-        return self.fc(x)
+        x = self.classifier(x)
+
+        return x
 
 
-# ============================================================
-# 4. COUNT TRAINABLE PARAMETERS
-# ============================================================
+# --------------------------------------------------
+# Count Parameters
+# --------------------------------------------------
 
-def count_parameters(model: nn.Module) -> int:
+def count_parameters(model):
     return sum(
-        p.numel()
-        for p in model.parameters()
-        if p.requires_grad
+        parameter.numel()
+        for parameter in model.parameters()
     )
 
 
-# ============================================================
-# 5. LOAD DATASET
-# ============================================================
+# --------------------------------------------------
+# Load Dataset
+# --------------------------------------------------
 
-def get_dataloaders(data_dir: str, batch_size: int = 32):
-
-    data_dir = Path(data_dir).resolve()
+def get_dataloaders(data_dir, batch_size=32):
+    data_dir = Path(data_dir).expanduser().resolve()
 
     train_dir = data_dir / "train"
     val_dir = data_dir / "val"
 
     if not train_dir.is_dir():
         raise FileNotFoundError(
-            f"Training dataset not found: {train_dir}"
+            f"Training folder not found: {train_dir}"
         )
 
     if not val_dir.is_dir():
         raise FileNotFoundError(
-            f"Validation dataset not found: {val_dir}"
+            f"Validation folder not found: {val_dir}"
         )
 
-    # Augmentation for training images
-    train_transform = transforms.Compose([
+    train_transforms = transforms.Compose([
         transforms.RandomResizedCrop(
             96,
             scale=(0.75, 1.0),
-            ratio=(0.9, 1.1)
+            ratio=(0.9, 1.1),
         ),
-        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(12),
         transforms.ColorJitter(
             brightness=0.2,
             contrast=0.2,
-            saturation=0.2
+            saturation=0.2,
         ),
         transforms.ToTensor(),
-        transforms.Normalize(MEAN, STD)
+        transforms.Normalize(MEAN, STD),
     ])
 
-    # Deterministic preprocessing for validation
-    val_transform = transforms.Compose([
+    val_transforms = transforms.Compose([
         transforms.Resize((96, 96)),
         transforms.ToTensor(),
-        transforms.Normalize(MEAN, STD)
+        transforms.Normalize(MEAN, STD),
     ])
 
     train_dataset = datasets.ImageFolder(
         str(train_dir),
-        transform=train_transform
+        transform=train_transforms,
     )
 
     val_dataset = datasets.ImageFolder(
         str(val_dir),
-        transform=val_transform
+        transform=val_transforms,
     )
 
     if train_dataset.classes != CLASSES:
         raise ValueError(
-            f"Expected classes: {CLASSES}\n"
-            f"Found classes: {train_dataset.classes}"
+            f"Unexpected training classes: {train_dataset.classes}\n"
+            f"Expected classes: {CLASSES}"
         )
 
     if train_dataset.class_to_idx != val_dataset.class_to_idx:
         raise ValueError(
-            "Training and validation class mappings differ."
+            "Training and validation class mappings do not match."
         )
+
+    use_pin_memory = torch.cuda.is_available()
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=0,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=use_pin_memory,
     )
 
     val_loader = DataLoader(
@@ -291,60 +271,93 @@ def get_dataloaders(data_dir: str, batch_size: int = 32):
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=use_pin_memory,
     )
 
     print(f"Training images: {len(train_dataset)}")
     print(f"Validation images: {len(val_dataset)}")
-    print(f"Class mapping: {train_dataset.class_to_idx}")
+    print(f"Classes: {train_dataset.classes}")
 
     return train_loader, val_loader
 
 
-# ============================================================
-# 6. TRAIN AND VALIDATE
-# ============================================================
+# --------------------------------------------------
+# Evaluate Model
+# --------------------------------------------------
+
+def evaluate(model, loader, criterion, device):
+    model.eval()
+
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            total_loss += loss.item() * labels.size(0)
+
+            predictions = outputs.argmax(dim=1)
+
+            correct += (
+                predictions == labels
+            ).sum().item()
+
+            total += labels.size(0)
+
+    average_loss = total_loss / max(total, 1)
+    accuracy = 100.0 * correct / max(total, 1)
+
+    return average_loss, accuracy
+
+
+# --------------------------------------------------
+# Train Model
+# --------------------------------------------------
 
 def train_model(
     model,
     train_loader,
     val_loader,
     device,
-    epochs,
-    lr,
-    patience=10
+    epochs=30,
+    lr=0.001,
 ):
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    criterion = nn.CrossEntropyLoss(
+        label_smoothing=0.05
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
-        weight_decay=1e-4
+        weight_decay=1e-4,
     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=epochs,
-        eta_min=lr * 0.01
+        T_max=max(epochs, 1),
+        eta_min=lr * 0.01,
     )
 
-    best_val_acc = -1.0
-    best_state = None
-    patience_counter = 0
+    best_accuracy = -1.0
+    patience = 10
+    epochs_without_improvement = 0
 
-    model_path = PROJECT_DIR / "best_model.pth"
+    best_model_path = PROJECT_DIR / "best_model.pth"
 
-    for epoch in range(1, epochs + 1):
-
-        # ---------------- TRAINING ----------------
+    for epoch in range(epochs):
         model.train()
 
-        train_loss_sum = 0.0
-        train_correct = 0
-        train_total = 0
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
         for images, labels in train_loader:
-
             images = images.to(device)
             labels = labels.to(device)
 
@@ -356,264 +369,234 @@ def train_model(
             loss.backward()
             optimizer.step()
 
-            train_loss_sum += loss.item() * images.size(0)
+            running_loss += loss.item() * labels.size(0)
 
-            train_correct += (
-                outputs.argmax(dim=1) == labels
+            predictions = outputs.argmax(dim=1)
+
+            correct += (
+                predictions == labels
             ).sum().item()
 
-            train_total += labels.size(0)
-
-        train_loss = train_loss_sum / train_total
-        train_acc = 100.0 * train_correct / train_total
-
-        # ---------------- VALIDATION ----------------
-        model.eval()
-
-        val_loss_sum = 0.0
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-            for images, labels in val_loader:
-
-                images = images.to(device)
-                labels = labels.to(device)
-
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-
-                val_loss_sum += loss.item() * images.size(0)
-
-                val_correct += (
-                    outputs.argmax(dim=1) == labels
-                ).sum().item()
-
-                val_total += labels.size(0)
-
-        val_loss = val_loss_sum / val_total
-        val_acc = 100.0 * val_correct / val_total
+            total += labels.size(0)
 
         scheduler.step()
 
-        print(
-            f"Epoch [{epoch:02d}/{epochs:02d}] "
-            f"Train Acc: {train_acc:.2f}% | "
-            f"Val Acc: {val_acc:.2f}% | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f} | "
-            f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+        train_loss = running_loss / max(total, 1)
+        train_accuracy = 100.0 * correct / max(total, 1)
+
+        val_loss, val_accuracy = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
         )
 
-        # Save the best validation checkpoint
-        if val_acc > best_val_acc:
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] "
+            f"Train Loss: {train_loss:.4f} "
+            f"Train Acc: {train_accuracy:.2f}% "
+            f"Val Loss: {val_loss:.4f} "
+            f"Val Acc: {val_accuracy:.2f}%"
+        )
 
-            best_val_acc = val_acc
-            patience_counter = 0
+        if val_accuracy > best_accuracy:
+            best_accuracy = val_accuracy
+            epochs_without_improvement = 0
 
-            best_state = copy.deepcopy(model.state_dict())
+            torch.save(
+                model.state_dict(),
+                best_model_path,
+            )
 
-            torch.save(best_state, model_path)
-
-            print(f"Best checkpoint saved: {model_path}")
-
+            print("Best model saved.")
         else:
-            patience_counter += 1
+            epochs_without_improvement += 1
 
-            if patience_counter >= patience:
-                print("Early stopping triggered.")
-                break
+        if epochs_without_improvement >= patience:
+            print("Early stopping: validation accuracy has not improved.")
+            break
 
-    if best_state is None:
-        raise RuntimeError("Training did not produce a checkpoint.")
+    model.load_state_dict(
+        torch.load(
+            best_model_path,
+            map_location=device,
+            weights_only=True,
+        )
+    )
 
-    model.load_state_dict(best_state)
-
-    print(f"\nBest validation accuracy: {best_val_acc:.2f}%")
+    print(f"Best validation accuracy: {best_accuracy:.2f}%")
 
     return model
 
 
-# ============================================================
-# 7. EXPORT TO ONNX
-# ============================================================
+# --------------------------------------------------
+# Export Model to ONNX
+# --------------------------------------------------
 
-def export_to_onnx(
-    model: nn.Module,
-    output_path: str = "model.onnx"
-):
-    model = model.cpu().eval()
-
-    output_path = Path(output_path)
+def export_to_onnx(model, output_path):
+    output_path = Path(output_path).expanduser()
 
     if not output_path.is_absolute():
         output_path = PROJECT_DIR / output_path
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    model = model.to("cpu")
+    model.eval()
 
     dummy_input = torch.randn(1, 3, 96, 96)
 
-    print(f"Exporting model to: {output_path}")
+    export_args = {
+        "input_names": ["input"],
+        "output_names": ["output"],
+        "dynamic_axes": {
+            "input": {0: "batch_size"},
+            "output": {0: "batch_size"},
+        },
+        "opset_version": 17,
+    }
 
     try:
         torch.onnx.export(
             model,
             dummy_input,
             str(output_path),
-            export_params=True,
-            opset_version=17,
-            do_constant_folding=True,
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={
-                "input": {0: "batch_size"},
-                "output": {0: "batch_size"}
-            },
-            dynamo=False
+            dynamo=False,
+            **export_args,
         )
-
     except TypeError:
         torch.onnx.export(
             model,
             dummy_input,
             str(output_path),
-            export_params=True,
-            opset_version=17,
-            do_constant_folding=True,
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={
-                "input": {0: "batch_size"},
-                "output": {0: "batch_size"}
-            }
+            **export_args,
         )
 
     size_mb = output_path.stat().st_size / (1024 * 1024)
 
-    print(f"ONNX file created: {output_path}")
-    print(f"File size: {size_mb:.3f} MiB")
+    print(f"ONNX model saved to: {output_path}")
+    print(f"ONNX model size: {size_mb:.3f} MB")
 
     if size_mb > MAX_MODEL_SIZE_MB:
-        print("WARNING: Model exceeds the file-size limit.")
-    else:
-        print("File-size limit satisfied.")
+        print("WARNING: ONNX model exceeds the 1.50 MB limit.")
 
-    # Verify the exported graph if ONNX Runtime is installed
     try:
+        import onnx
         import onnxruntime as ort
-        import numpy as np
+
+        onnx_model = onnx.load(str(output_path))
+        onnx.checker.check_model(onnx_model)
 
         session = ort.InferenceSession(
             str(output_path),
-            providers=["CPUExecutionProvider"]
+            providers=["CPUExecutionProvider"],
         )
 
         result = session.run(
             ["output"],
-            {"input": np.zeros((1, 3, 96, 96), dtype=np.float32)}
+            {"input": dummy_input.numpy()},
         )[0]
 
-        print(f"ONNX test output shape: {result.shape}")
+        print(f"ONNX output shape: {result.shape}")
 
         if result.shape != (1, len(CLASSES)):
             raise RuntimeError(
-                f"Unexpected output shape: {result.shape}"
+                f"Unexpected ONNX output shape: {result.shape}"
             )
-
-        print("ONNX inference test passed.")
 
     except ImportError:
         print(
-            "ONNX Runtime is not installed; "
-            "skipping the inference test."
+            "ONNX validation skipped. Install onnx and "
+            "onnxruntime to validate the exported model."
         )
 
 
-# ============================================================
-# 8. MAIN FUNCTION
-# ============================================================
+# --------------------------------------------------
+# Main Function
+# --------------------------------------------------
 
 def main():
-
     parser = argparse.ArgumentParser(
-        description="EcoSort Lightweight CNN Training"
+        description="Train and export the EcoSort CNN model."
     )
 
     parser.add_argument(
         "--data_dir",
         type=str,
         default=str(PROJECT_DIR / "data" / "public"),
-        help="Directory containing train and val folders"
+        help="Path containing train/ and val/ folders.",
     )
 
     parser.add_argument(
         "--epochs",
         type=int,
         default=30,
-        help="Maximum number of training epochs"
+        help="Maximum number of training epochs.",
     )
 
     parser.add_argument(
         "--batch_size",
         type=int,
         default=32,
-        help="Training batch size"
+        help="Training batch size.",
     )
 
     parser.add_argument(
         "--lr",
         type=float,
         default=0.001,
-        help="Initial learning rate"
+        help="Learning rate.",
     )
 
     parser.add_argument(
         "--output",
         type=str,
         default="model.onnx",
-        help="Output ONNX filename"
+        help="Output ONNX file path.",
     )
 
     args = parser.parse_args()
 
-    if args.epochs < 1 or args.batch_size < 1 or args.lr <= 0:
-        parser.error("epochs, batch_size and lr must be positive.")
+    if args.epochs < 1:
+        parser.error("--epochs must be at least 1.")
+
+    if args.batch_size < 1:
+        parser.error("--batch_size must be at least 1.")
+
+    if args.lr <= 0:
+        parser.error("--lr must be greater than 0.")
 
     torch.manual_seed(42)
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-    print("=" * 60)
-    print("EcoSort Edge-AI Training")
-    print("=" * 60)
-
-    print(f"Project directory: {PROJECT_DIR}")
-    print(f"Dataset directory: {Path(args.data_dir).resolve()}")
-    print(f"Device: {device}")
+    print(f"Using device: {device}")
 
     train_loader, val_loader = get_dataloaders(
         args.data_dir,
-        batch_size=args.batch_size
+        args.batch_size,
     )
 
     model = ToyClassifier(
         num_classes=len(CLASSES)
     ).to(device)
 
-    total_params = count_parameters(model)
+    total_parameters = count_parameters(model)
 
-    print(f"Trainable parameters: {total_params:,}")
-    print(f"Maximum allowed: {MAX_PARAMETERS:,}")
+    print(f"Model parameters: {total_parameters:,}")
 
-    if total_params > MAX_PARAMETERS:
+    if total_parameters > MAX_PARAMETERS:
         raise RuntimeError(
-            "Model exceeds the parameter limit. "
-            "Reduce the model size before training."
+            f"Model has {total_parameters:,} parameters; "
+            f"the limit is {MAX_PARAMETERS:,}."
         )
 
     model = train_model(
@@ -621,23 +604,17 @@ def main():
         train_loader,
         val_loader,
         device,
-        args.epochs,
-        args.lr
+        epochs=args.epochs,
+        lr=args.lr,
     )
 
-    # Export the best validation checkpoint
     export_to_onnx(
         model,
-        output_path=args.output
+        args.output,
     )
 
-    print("\nTraining and export complete.")
-    print("Next, run the challenge verification tool:")
-    print(
-        f"python verify_submission.py "
-        f"--model {args.output} "
-        f"--val_dir {args.data_dir}/val"
-    )
+    print("\nTraining and export completed.")
+    print("Next, verify the model using verify_submission.py.")
 
 
 if __name__ == "__main__":
